@@ -30,7 +30,7 @@ class Test_SwiGLU(common.PyTestCase):
         ],
     )
     @pytest.mark.parametrize("backend", _backends)
-    def test_forward(self, batch_size, seq_len, hidden_size, intermediate_size, backend, arch):
+    def test_op_forward(self, batch_size, seq_len, hidden_size, intermediate_size, backend, arch):
         """Test for functional correctness of SwiGLU forward pass."""
         self.setUp()
         try:
@@ -71,7 +71,7 @@ class Test_SwiGLU(common.PyTestCase):
         ],
     )
     @pytest.mark.parametrize("backend", _backends)
-    def test_forward_irregular_shapes(self, batch_size, seq_len, hidden_size, backend, arch):
+    def test_op_forward_irregular(self, batch_size, seq_len, hidden_size, backend, arch):
         """Test forward pass with irregular (non-power-of-2) shapes."""
         self.setUp()
         try:
@@ -103,7 +103,7 @@ class Test_SwiGLU(common.PyTestCase):
         ],
     )
     @pytest.mark.parametrize("backend", _backends)
-    def test_backward(self, batch_size, seq_len, hidden_size, dtype, backend, arch):
+    def test_op_backward(self, batch_size, seq_len, hidden_size, dtype, backend, arch):
         """Test backward pass of SwiGLU (SiLUMulFunction)."""
         self.setUp()
         try:
@@ -156,7 +156,7 @@ class Test_SwiGLU(common.PyTestCase):
         ],
     )
     @pytest.mark.parametrize("backend", _backends)
-    def test_backward_irregular_shapes(self, batch_size, seq_len, hidden_size, backend, arch):
+    def test_op_backward_irregular(self, batch_size, seq_len, hidden_size, backend, arch):
         """Test backward pass with irregular (non-power-of-2) shapes."""
         self.setUp()
         try:

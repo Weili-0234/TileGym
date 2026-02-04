@@ -47,7 +47,7 @@ def create_benchmark_config(mode, hidden_size, dtype):
         line_names=list(names),
         styles=list(styles),
         ylabel="GB/s",
-        plot_name=f"swiglu-{mode_name}-hidden{hidden_size}-{dtype_name}",
+        plot_name=f"swiglu-{mode_name}-hidden{hidden_size}-{dtype_name}-GBps",
         args={
             "hidden_size": hidden_size,
             "dtype": dtype,

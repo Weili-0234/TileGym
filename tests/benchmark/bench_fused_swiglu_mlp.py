@@ -53,7 +53,7 @@ MODEL_CONFIGS = {
 def get_providers():
     providers = [("torch", "PyTorch", ("green", "-"))]
     if is_backend_available("cutile"):
-        providers.insert(0, ("tilegym", "TileGym", ("orange", "-")))
+        providers.insert(0, ("cutile", "CuTile", ("orange", "-")))
     return providers
 
 
@@ -73,7 +73,7 @@ def create_benchmark_config(mode, model_name, batch_size):
         line_names=list(names),
         styles=list(styles),
         ylabel="GB/s",
-        plot_name=f"fused-swiglu-mlp-{mode_name}-{model_name}-bs{batch_size}",
+        plot_name=f"fused-swiglu-mlp-{mode_name}-{model_name}-bs{batch_size}-GBps",
         args={
             "model_name": model_name,
             "batch_size": batch_size,
@@ -105,7 +105,7 @@ def bench_fused_swiglu_mlp(
     I = config.intermediate_size
 
     # Create MLP module
-    if backend == "tilegym":
+    if backend == "cutile":
         tilegym.set_backend("cutile")
         mlp = PartiallyFusedSwiGLUMLP(config).to(device).to(dtype)
     else:
