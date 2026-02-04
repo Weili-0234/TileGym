@@ -21,14 +21,12 @@ class Test_SiLUAndMul(common.PyTestCase):
 
     _backends = ["cutile"]
 
-    # Regular shapes with power-of-2 dimensions
     @pytest.mark.parametrize(
         "batch_size, seq_len, hidden_size, dtype",
         [
-            # Original test cases
             (32, 1024, 512, torch.float16),
             (32, 1024, 1024, torch.float32),
-            # Expanded combinations: bs={8, 16, 32}, seq_len={512, 1024}, hidden={512, 1024, 2048, 4096}
+            (32, 1024, 4096, torch.float32),
             (8, 512, 512, torch.float16),
             (8, 512, 1024, torch.float16),
             (8, 512, 2048, torch.float32),
@@ -37,7 +35,6 @@ class Test_SiLUAndMul(common.PyTestCase):
             (8, 1024, 2048, torch.float32),
             (16, 512, 512, torch.float16),
             (16, 512, 1024, torch.float32),
-            (16, 512, 2048, torch.float16),
             (16, 1024, 512, torch.float32),
             (16, 1024, 1024, torch.float16),
             (16, 1024, 2048, torch.float32),
