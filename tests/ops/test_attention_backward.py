@@ -2,18 +2,6 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""
-Comprehensive tests for Flash Attention backward pass.
-
-Test categories:
-1. Regular shapes (power of 2)
-2. Irregular shapes (non-power of 2)
-3. Corner cases (edge conditions)
-4. GQA (Grouped Query Attention)
-5. Causal vs non-causal
-6. Different dtypes (float16, bfloat16)
-"""
-
 import math
 
 import pytest

@@ -4,18 +4,6 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""
-Performance benchmarks for Flash Attention training forward, backward, and fwd+bwd.
-
-Compares CuTile implementation against:
-- PyTorch SDPA Flash backend
-- PyTorch SDPA Memory Efficient backend
-- PyTorch SDPA Math backend
-
-Usage:
-    python tests/benchmark/bench_attention_backward.py
-"""
-
 import math
 
 import torch
