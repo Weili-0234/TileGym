@@ -110,15 +110,9 @@ def bench_fused_attention_backward(
     dtype = datatype
     sm_scale = 1.0 / math.sqrt(HEAD_DIM)
 
-    q = torch.randn(
-        (BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True
-    )
-    k = torch.randn(
-        (BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True
-    )
-    v = torch.randn(
-        (BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True
-    )
+    q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
 
     # Build training forward function per backend (saves state for backward)
     if backend == "cutile":
@@ -131,9 +125,7 @@ def bench_fused_attention_backward(
 
         def fwd_fn():
             with sdpa_kernel(sdp_b):
-                return torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v, is_causal=causal, scale=sm_scale
-                )
+                return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=sm_scale)
 
     else:
         return float("nan")

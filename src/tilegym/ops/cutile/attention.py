@@ -12,6 +12,7 @@ from cuda.tile import RoundingMode as RMd
 
 from tilegym.backend import register_impl
 from tilegym.logger import get_logger
+
 from .utils import next_power_of_2
 
 logger = get_logger(__name__)
@@ -188,9 +189,7 @@ def fmha_fwd_kernel_with_lse(
     l_i = ct.full((TILE_M, 1), 0.0, dtype=ct.float32)
     acc = ct.full((TILE_M, TILE_D), 0.0, dtype=ct.float32)
 
-    q = ct.load(Q, index=(batch_idx, head_idx, bid_x, 0), shape=(1, 1, TILE_M, TILE_D)).reshape(
-        (TILE_M, TILE_D)
-    )
+    q = ct.load(Q, index=(batch_idx, head_idx, bid_x, 0), shape=(1, 1, TILE_M, TILE_D)).reshape((TILE_M, TILE_D))
 
     m_end = input_pos + (bid_x + 1) * TILE_M
     k_seqlen = K.shape[2]
@@ -264,6 +263,7 @@ def fmha_fwd_kernel_with_lse(
 
 # --- Backward Pass Kernels ---
 
+
 @ct.kernel(occupancy=2)
 def fmha_bwd_preprocess_kernel(
     O,
@@ -284,12 +284,14 @@ def fmha_bwd_preprocess_kernel(
     head_idx = bid_hz % H
 
     # Load O and dO tiles using tile-based indexing (bid_m is tile index)
-    o_tile = ct.load(O, index=(batch_idx, head_idx, bid_m, 0), shape=(1, 1, TILE_M, TILE_D),
-                     padding_mode=ct.PaddingMode.ZERO)
+    o_tile = ct.load(
+        O, index=(batch_idx, head_idx, bid_m, 0), shape=(1, 1, TILE_M, TILE_D), padding_mode=ct.PaddingMode.ZERO
+    )
     o_tile = o_tile.reshape((TILE_M, TILE_D)).astype(ct.float32)
 
-    do_tile = ct.load(dO, index=(batch_idx, head_idx, bid_m, 0), shape=(1, 1, TILE_M, TILE_D),
-                      padding_mode=ct.PaddingMode.ZERO)
+    do_tile = ct.load(
+        dO, index=(batch_idx, head_idx, bid_m, 0), shape=(1, 1, TILE_M, TILE_D), padding_mode=ct.PaddingMode.ZERO
+    )
     do_tile = do_tile.reshape((TILE_M, TILE_D)).astype(ct.float32)
 
     # Compute row-wise dot product: Delta[i] = sum_d(O[i,d] * dO[i,d])
@@ -346,11 +348,21 @@ def fmha_bwd_dkdv_kernel(
 
     # Load K and V for this block (same for all query heads in the group)
     # Use latency hint for TMA optimization
-    k = ct.load(K, index=(batch_idx, kv_head_idx, bid_n, 0), shape=(1, 1, TILE_N, TILE_D),
-                padding_mode=ct.PaddingMode.ZERO, latency=2)
+    k = ct.load(
+        K,
+        index=(batch_idx, kv_head_idx, bid_n, 0),
+        shape=(1, 1, TILE_N, TILE_D),
+        padding_mode=ct.PaddingMode.ZERO,
+        latency=2,
+    )
     k = k.reshape((TILE_N, TILE_D))
-    v = ct.load(V, index=(batch_idx, kv_head_idx, bid_n, 0), shape=(1, 1, TILE_N, TILE_D),
-                padding_mode=ct.PaddingMode.ZERO, latency=2)
+    v = ct.load(
+        V,
+        index=(batch_idx, kv_head_idx, bid_n, 0),
+        shape=(1, 1, TILE_N, TILE_D),
+        padding_mode=ct.PaddingMode.ZERO,
+        latency=2,
+    )
     v = v.reshape((TILE_N, TILE_D))
 
     # Offsets for this K/V tile
@@ -379,13 +391,23 @@ def fmha_bwd_dkdv_kernel(
             offs_m = offs_m[None, :]  # [1, TILE_M]
 
             # Load Q tile for this query head (with TMA latency hints)
-            q = ct.load(Q, index=(batch_idx, q_head_idx, m_idx, 0), shape=(1, 1, TILE_M, TILE_D),
-                        padding_mode=ct.PaddingMode.ZERO, latency=2)
+            q = ct.load(
+                Q,
+                index=(batch_idx, q_head_idx, m_idx, 0),
+                shape=(1, 1, TILE_M, TILE_D),
+                padding_mode=ct.PaddingMode.ZERO,
+                latency=2,
+            )
             q = q.reshape((TILE_M, TILE_D))
 
             # Load dO tile for this query head
-            do = ct.load(dO, index=(batch_idx, q_head_idx, m_idx, 0), shape=(1, 1, TILE_M, TILE_D),
-                         padding_mode=ct.PaddingMode.ZERO, latency=3)
+            do = ct.load(
+                dO,
+                index=(batch_idx, q_head_idx, m_idx, 0),
+                shape=(1, 1, TILE_M, TILE_D),
+                padding_mode=ct.PaddingMode.ZERO,
+                latency=3,
+            )
             do = do.reshape((TILE_M, TILE_D))
 
             # Load LSE and Delta for this query head
@@ -471,15 +493,27 @@ def fmha_bwd_dq_kernel(
     dq_acc = ct.full((TILE_M, TILE_D), 0.0, dtype=ct.float32)
 
     # Load Q, dO for this block using tile-based indexing (with TMA latency hints)
-    q = ct.load(Q, index=(batch_idx, head_idx, bid_m, 0), shape=(1, 1, TILE_M, TILE_D),
-                padding_mode=ct.PaddingMode.ZERO, latency=2)
+    q = ct.load(
+        Q,
+        index=(batch_idx, head_idx, bid_m, 0),
+        shape=(1, 1, TILE_M, TILE_D),
+        padding_mode=ct.PaddingMode.ZERO,
+        latency=2,
+    )
     q = q.reshape((TILE_M, TILE_D))
-    do = ct.load(dO, index=(batch_idx, head_idx, bid_m, 0), shape=(1, 1, TILE_M, TILE_D),
-                 padding_mode=ct.PaddingMode.ZERO, latency=2)
+    do = ct.load(
+        dO,
+        index=(batch_idx, head_idx, bid_m, 0),
+        shape=(1, 1, TILE_M, TILE_D),
+        padding_mode=ct.PaddingMode.ZERO,
+        latency=2,
+    )
     do = do.reshape((TILE_M, TILE_D))
 
     # Load LSE and Delta using gather (they're 1D flattened)
-    lse_delta_indices = batch_idx * (H * SEQ_LEN) + head_idx * SEQ_LEN + bid_m * TILE_M + ct.arange(TILE_M, dtype=ct.int32)
+    lse_delta_indices = (
+        batch_idx * (H * SEQ_LEN) + head_idx * SEQ_LEN + bid_m * TILE_M + ct.arange(TILE_M, dtype=ct.int32)
+    )
     lse = ct.gather(LSE, lse_delta_indices).reshape((TILE_M, 1))  # [TILE_M, 1]
     delta = ct.gather(Delta, lse_delta_indices).reshape((TILE_M, 1))  # [TILE_M, 1]
 
@@ -501,11 +535,21 @@ def fmha_bwd_dq_kernel(
         offs_n = offs_n[None, :]  # [1, TILE_N]
 
         # Load K and V tiles using tile-based indexing (with TMA latency hints)
-        k = ct.load(K, index=(batch_idx, off_kv_h, n_idx, 0), shape=(1, 1, TILE_N, TILE_D),
-                    padding_mode=ct.PaddingMode.ZERO, latency=2)
+        k = ct.load(
+            K,
+            index=(batch_idx, off_kv_h, n_idx, 0),
+            shape=(1, 1, TILE_N, TILE_D),
+            padding_mode=ct.PaddingMode.ZERO,
+            latency=2,
+        )
         k = k.reshape((TILE_N, TILE_D))
-        v = ct.load(V, index=(batch_idx, off_kv_h, n_idx, 0), shape=(1, 1, TILE_N, TILE_D),
-                    padding_mode=ct.PaddingMode.ZERO, latency=4)
+        v = ct.load(
+            V,
+            index=(batch_idx, off_kv_h, n_idx, 0),
+            shape=(1, 1, TILE_N, TILE_D),
+            padding_mode=ct.PaddingMode.ZERO,
+            latency=4,
+        )
         v = v.reshape((TILE_N, TILE_D))
 
         # Compute Q @ K^T: [TILE_M, TILE_N]
@@ -579,9 +623,7 @@ def _fmha_autotune_configs(head_dim: int | None = None):
     Only tunes tile sizes; num_ctas and occupancy are left to the compiler.
     """
     key = _head_dim_key(head_dim)
-    tile_ms, tile_ns = _FMHA_FWD_TILE_CONFIGS_BY_D.get(
-        key, ([64, 128, 256], [32, 64, 128])
-    )
+    tile_ms, tile_ns = _FMHA_FWD_TILE_CONFIGS_BY_D.get(key, ([64, 128, 256], [32, 64, 128]))
     yield from _iter_tile_configs(tile_ms, tile_ns)
 
 
@@ -688,12 +730,8 @@ def _fmha_bwd_autotune_configs(head_dim: int | None = None):
     tile sizes for padding calculation.
     """
     key = _head_dim_key(head_dim)
-    dkdv_ms, dkdv_ns = _FMHA_BWD_DKDV_TILE_CONFIGS_BY_D.get(
-        key, ([32, 64, 128], [64, 128])
-    )
-    dq_ms, dq_ns = _FMHA_BWD_DQ_TILE_CONFIGS_BY_D.get(
-        key, ([64, 128], [32, 64, 128])
-    )
+    dkdv_ms, dkdv_ns = _FMHA_BWD_DKDV_TILE_CONFIGS_BY_D.get(key, ([32, 64, 128], [64, 128]))
+    dq_ms, dq_ns = _FMHA_BWD_DQ_TILE_CONFIGS_BY_D.get(key, ([64, 128], [32, 64, 128]))
     tile_ms = sorted(set(dkdv_ms + dq_ms))
     tile_ns = sorted(set(dkdv_ns + dq_ns))
     yield from _iter_tile_configs(tile_ms, tile_ns)
@@ -709,9 +747,7 @@ def _fmha_bwd_dkdv_autotune_configs(head_dim: int | None = None):
     - TILE_N: [64, 128] (K/V tile, this block's tile)
     """
     key = _head_dim_key(head_dim)
-    tile_ms, tile_ns = _FMHA_BWD_DKDV_TILE_CONFIGS_BY_D.get(
-        key, ([32, 64, 128], [64, 128])
-    )
+    tile_ms, tile_ns = _FMHA_BWD_DKDV_TILE_CONFIGS_BY_D.get(key, ([32, 64, 128], [64, 128]))
     yield from _iter_tile_configs(tile_ms, tile_ns)
 
 
@@ -725,13 +761,12 @@ def _fmha_bwd_dq_autotune_configs(head_dim: int | None = None):
     - TILE_N: [32, 64, 128] (K/V tile, inner loop)
     """
     key = _head_dim_key(head_dim)
-    tile_ms, tile_ns = _FMHA_BWD_DQ_TILE_CONFIGS_BY_D.get(
-        key, ([64, 128], [32, 64, 128])
-    )
+    tile_ms, tile_ns = _FMHA_BWD_DQ_TILE_CONFIGS_BY_D.get(key, ([64, 128], [32, 64, 128]))
     yield from _iter_tile_configs(tile_ms, tile_ns)
 
 
 # --- Backward Pass Python Functions ---
+
 
 def fmha_forward_with_lse(
     q: torch.Tensor,
@@ -870,7 +905,9 @@ def fmha_backward(
 
     # Pad and flatten LSE for gather operations
     if q_len != padded_q_len:
-        lse_padded = torch.full((batch_size, num_heads, padded_q_len), float('inf'), dtype=torch.float32, device=q.device)
+        lse_padded = torch.full(
+            (batch_size, num_heads, padded_q_len), float("inf"), dtype=torch.float32, device=q.device
+        )
         lse_padded[:, :, :q_len] = lse
         lse_flat = lse_padded.view(-1).contiguous()
     else:
@@ -903,9 +940,23 @@ def fmha_backward(
         ),
         kernel=fmha_bwd_dkdv_kernel,
         args_fn=lambda cfg: (
-            q, k, v, do, dk, dv, lse_flat, delta_flat,
-            sm_scale, TILE_D, num_heads, num_head_kv, padded_q_len,
-            cfg.TILE_M, cfg.TILE_N, query_group_size, is_causal,
+            q,
+            k,
+            v,
+            do,
+            dk,
+            dv,
+            lse_flat,
+            delta_flat,
+            sm_scale,
+            TILE_D,
+            num_heads,
+            num_head_kv,
+            padded_q_len,
+            cfg.TILE_M,
+            cfg.TILE_N,
+            query_group_size,
+            is_causal,
         ),
         search_space=lambda: _fmha_bwd_dkdv_autotune_configs(hidden_size),
         max_iter=20,
@@ -921,9 +972,21 @@ def fmha_backward(
         ),
         kernel=fmha_bwd_dq_kernel,
         args_fn=lambda cfg: (
-            q, k, v, do, dq, lse_flat, delta_flat,
-            sm_scale, TILE_D, num_heads, padded_q_len,
-            cfg.TILE_M, cfg.TILE_N, query_group_size, is_causal,
+            q,
+            k,
+            v,
+            do,
+            dq,
+            lse_flat,
+            delta_flat,
+            sm_scale,
+            TILE_D,
+            num_heads,
+            padded_q_len,
+            cfg.TILE_M,
+            cfg.TILE_N,
+            query_group_size,
+            is_causal,
         ),
         search_space=lambda: _fmha_bwd_dq_autotune_configs(hidden_size),
         max_iter=20,
@@ -933,6 +996,7 @@ def fmha_backward(
 
 
 # --- Autograd Function ---
+
 
 class FlashAttentionFunction(torch.autograd.Function):
     """
@@ -985,6 +1049,7 @@ class FlashAttentionFunction(torch.autograd.Function):
 
 
 # --- Public API ---
+
 
 def tile_fmha_with_backward(
     q: torch.Tensor,

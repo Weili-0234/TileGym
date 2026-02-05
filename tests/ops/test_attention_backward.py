@@ -20,13 +20,11 @@ import pytest
 import torch
 
 from tilegym.backend import set_backend
-from tilegym.ops.cutile.attention import (
-    FlashAttentionFunction,
-    fmha_backward,
-    fmha_forward_with_lse,
-    tile_fmha_with_backward,
-    tile_fmha_functional,
-)
+from tilegym.ops.cutile.attention import FlashAttentionFunction
+from tilegym.ops.cutile.attention import fmha_backward
+from tilegym.ops.cutile.attention import fmha_forward_with_lse
+from tilegym.ops.cutile.attention import tile_fmha_functional
+from tilegym.ops.cutile.attention import tile_fmha_with_backward
 
 from .. import common
 
