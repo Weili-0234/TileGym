@@ -369,7 +369,138 @@ def fmha_bwd_dkdv_kernel(
     # Loop over all query heads that share this KV head
     for qh_offset in range(QUERY_GROUP_SIZE):
         q_head_idx = kv_head_idx * QUERY_GROUP_SIZE + qh_offset
+        # Precompute base index for LSE/Delta gather for this query head
+        lse_delta_base = batch_idx * (H_Q * SEQ_LEN) + q_head_idx * SEQ_LEN
 
+        # Loop over Q tiles for this query head
+        for m_idx in range(start_m, num_m_tiles):
+            offs_m = m_idx * TILE_M + ct.arange(TILE_M, dtype=ct.int32)
+            offs_m = offs_m[None, :]  # [1, TILE_M]
+
+            # Load Q tile for this query head (with TMA latency hints)
+            q = ct.load(Q, index=(batch_idx, q_head_idx, m_idx, 0), shape=(1, 1, TILE_M, TILE_D),
+                        padding_mode=ct.PaddingMode.ZERO, latency=2)
+            q = q.reshape((TILE_M, TILE_D))
+
+            # Load dO tile for this query head
+            do = ct.load(dO, index=(batch_idx, q_head_idx, m_idx, 0), shape=(1, 1, TILE_M, TILE_D),
+                         padding_mode=ct.PaddingMode.ZERO, latency=3)
+            do = do.reshape((TILE_M, TILE_D))
+
+            # Load LSE and Delta for this query head
+            lse_indices = lse_delta_base + m_idx * TILE_M + lse_delta_offsets
+            lse = ct.gather(LSE, lse_indices)  # [TILE_M]
+            delta = ct.gather(Delta, lse_indices)  # [TILE_M]
+
+            # Compute K @ Q^T: [TILE_N, TILE_M]
+            qk = ct.full((TILE_N, TILE_M), 0.0, dtype=ct.float32)
+            q_t = q.permute((1, 0))  # [TILE_D, TILE_M]
+            qk = ct.mma(k, q_t, qk)  # [TILE_N, TILE_M]
+
+            # Compute P = softmax(QK^T) = exp2(QK * scale - LSE)
+            lse_broadcast = lse[None, :]  # [1, TILE_M]
+            p_t = ct.exp2(qk * qk_scale_log2 - lse_broadcast, flush_to_zero=True)  # [TILE_N, TILE_M]
+
+            # Apply causal mask
+            if CAUSAL:
+                mask = offs_n <= offs_m  # [TILE_N, TILE_M]: k_pos <= q_pos
+                p_t = ct.where(mask, p_t, 0.0)
+
+            # Compute dV += P^T @ dO
+            p_t_cast = p_t.astype(Q.dtype)
+            dv_acc = ct.mma(p_t_cast, do, dv_acc)  # [TILE_N, TILE_D]
+
+            # Compute dP = dO @ V^T: we need dP^T = V @ dO^T
+            do_t = do.permute((1, 0))  # [TILE_D, TILE_M]
+            dp_t = ct.full((TILE_N, TILE_M), 0.0, dtype=ct.float32)
+            dp_t = ct.mma(v, do_t, dp_t)  # [TILE_N, TILE_M]
+
+            # Compute dS = P * (dP - Delta)
+            delta_broadcast = delta[None, :]  # [1, TILE_M]
+            ds_t = p_t * (dp_t - delta_broadcast)  # [TILE_N, TILE_M]
+
+            # Compute dK += dS^T @ Q
+            ds_t_cast = ds_t.astype(Q.dtype)
+            dk_acc = ct.mma(ds_t_cast, q, dk_acc)  # [TILE_N, TILE_D]
+
+    # Apply scale to dK
+    dk_acc = dk_acc * qk_scale
+
+    # Store dK and dV (now properly accumulated from all query heads in the group)
+    dk_store = dk_acc.reshape((1, 1, TILE_N, TILE_D)).astype(dK.dtype)
+    dv_store = dv_acc.reshape((1, 1, TILE_N, TILE_D)).astype(dV.dtype)
+    ct.store(dK, index=(batch_idx, kv_head_idx, bid_n, 0), tile=dk_store)
+    ct.store(dV, index=(batch_idx, kv_head_idx, bid_n, 0), tile=dv_store)
+
+
+@ct.kernel(occupancy=1)
+def fmha_bwd_dkdv_kernel_occ1(
+    Q,
+    K,
+    V,
+    dO,
+    dK,
+    dV,
+    LSE,  # Passed as 1D flattened
+    Delta,  # Passed as 1D flattened
+    qk_scale: float,
+    TILE_D: ConstInt,
+    H_Q: ConstInt,  # Number of query heads
+    H_KV: ConstInt,  # Number of KV heads
+    SEQ_LEN: ConstInt,
+    TILE_M: ConstInt,  # Query tile size for inner loop
+    TILE_N: ConstInt,  # K/V tile size (this block's tile)
+    QUERY_GROUP_SIZE: ConstInt,
+    CAUSAL: ConstBool,
+):
+    """
+    Compute dK and dV gradients.
+    Each block handles one K/V tile for one KV head and iterates over all Q tiles
+    from all query heads that share this KV head.
+
+    For GQA (Grouped Query Attention), multiple query heads share the same KV head.
+    This kernel accumulates gradients from all query heads in the group.
+    """
+    bid_n = ct.bid(0)  # K/V tile index
+    bid_hz = ct.bid(1)  # batch_idx * H_KV + kv_head_idx
+    batch_idx = bid_hz // H_KV
+    kv_head_idx = bid_hz % H_KV
+
+    q_seqlen = Q.shape[2]
+    k_seqlen = K.shape[2]
+
+    # Scale for exp2
+    qk_scale_log2 = qk_scale * INV_LOG_2
+
+    # Initialize accumulators for dK and dV
+    dk_acc = ct.full((TILE_N, TILE_D), 0.0, dtype=ct.float32)
+    dv_acc = ct.full((TILE_N, TILE_D), 0.0, dtype=ct.float32)
+
+    # Load K and V for this block (same for all query heads in the group)
+    # Use latency hint for TMA optimization
+    k = ct.load(K, index=(batch_idx, kv_head_idx, bid_n, 0), shape=(1, 1, TILE_N, TILE_D),
+                padding_mode=ct.PaddingMode.ZERO, latency=2)
+    k = k.reshape((TILE_N, TILE_D))
+    v = ct.load(V, index=(batch_idx, kv_head_idx, bid_n, 0), shape=(1, 1, TILE_N, TILE_D),
+                padding_mode=ct.PaddingMode.ZERO, latency=2)
+    v = v.reshape((TILE_N, TILE_D))
+
+    # Offsets for this K/V tile
+    offs_n = bid_n * TILE_N + ct.arange(TILE_N, dtype=ct.int32)
+    offs_n = offs_n[:, None]  # [TILE_N, 1]
+
+    # Determine loop bounds based on causal masking
+    if CAUSAL:
+        start_m = bid_n * TILE_N // TILE_M
+    else:
+        start_m = 0
+    num_m_tiles = ct.cdiv(q_seqlen, TILE_M)
+
+    lse_delta_offsets = ct.arange(TILE_M, dtype=ct.int32)
+
+    # Loop over all query heads that share this KV head
+    for qh_offset in range(QUERY_GROUP_SIZE):
+        q_head_idx = kv_head_idx * QUERY_GROUP_SIZE + qh_offset
         # Precompute base index for LSE/Delta gather for this query head
         lse_delta_base = batch_idx * (H_Q * SEQ_LEN) + q_head_idx * SEQ_LEN
 
@@ -653,8 +784,227 @@ def tile_fmha(
     return o
 
 
+@ct.kernel(occupancy=1)
+def fmha_bwd_dq_kernel_occ1(
+    Q,
+    K,
+    V,
+    dO,
+    dQ,
+    LSE,  # Passed as 1D flattened
+    Delta,  # Passed as 1D flattened
+    qk_scale: float,
+    TILE_D: ConstInt,
+    H: ConstInt,
+    SEQ_LEN: ConstInt,
+    TILE_M: ConstInt,  # Q tile size (this block's tile)
+    TILE_N: ConstInt,  # K/V tile size for inner loop
+    QUERY_GROUP_SIZE: ConstInt,
+    CAUSAL: ConstBool,
+):
+    """
+    Compute dQ gradient.
+    Each block handles one Q tile and iterates over all K/V tiles.
+    """
+    bid_m = ct.bid(0)  # Q tile index
+    bid_hz = ct.bid(1)
+    batch_idx = bid_hz // H
+    head_idx = bid_hz % H
+    off_kv_h = head_idx // QUERY_GROUP_SIZE
+
+    k_seqlen = K.shape[2]
+
+    # Scale for exp2
+    qk_scale_log2 = qk_scale * INV_LOG_2
+
+    # Initialize accumulator for dQ
+    dq_acc = ct.full((TILE_M, TILE_D), 0.0, dtype=ct.float32)
+
+    # Load Q, dO for this block using tile-based indexing (with TMA latency hints)
+    q = ct.load(Q, index=(batch_idx, head_idx, bid_m, 0), shape=(1, 1, TILE_M, TILE_D),
+                padding_mode=ct.PaddingMode.ZERO, latency=2)
+    q = q.reshape((TILE_M, TILE_D))
+    do = ct.load(dO, index=(batch_idx, head_idx, bid_m, 0), shape=(1, 1, TILE_M, TILE_D),
+                 padding_mode=ct.PaddingMode.ZERO, latency=2)
+    do = do.reshape((TILE_M, TILE_D))
+
+    # Load LSE and Delta using gather (they're 1D flattened)
+    lse_delta_indices = batch_idx * (H * SEQ_LEN) + head_idx * SEQ_LEN + bid_m * TILE_M + ct.arange(TILE_M, dtype=ct.int32)
+    lse = ct.gather(LSE, lse_delta_indices).reshape((TILE_M, 1))  # [TILE_M, 1]
+    delta = ct.gather(Delta, lse_delta_indices).reshape((TILE_M, 1))  # [TILE_M, 1]
+
+    # Offsets for this Q tile
+    offs_m = bid_m * TILE_M + ct.arange(TILE_M, dtype=ct.int32)
+    offs_m = offs_m[:, None]  # [TILE_M, 1]
+
+    # Determine loop bounds based on causal masking
+    if CAUSAL:
+        # Only process K/V tiles where k_pos <= q_pos (at least partially)
+        end_n = ct.cdiv((bid_m + 1) * TILE_M, TILE_N)
+        end_n = min(end_n, ct.cdiv(k_seqlen, TILE_N))
+    else:
+        end_n = ct.cdiv(k_seqlen, TILE_N)
+
+    # Loop over K/V tiles
+    for n_idx in range(0, end_n):
+        offs_n = n_idx * TILE_N + ct.arange(TILE_N, dtype=ct.int32)
+        offs_n = offs_n[None, :]  # [1, TILE_N]
+
+        # Load K and V tiles using tile-based indexing (with TMA latency hints)
+        k = ct.load(K, index=(batch_idx, off_kv_h, n_idx, 0), shape=(1, 1, TILE_N, TILE_D),
+                    padding_mode=ct.PaddingMode.ZERO, latency=2)
+        k = k.reshape((TILE_N, TILE_D))
+        v = ct.load(V, index=(batch_idx, off_kv_h, n_idx, 0), shape=(1, 1, TILE_N, TILE_D),
+                    padding_mode=ct.PaddingMode.ZERO, latency=4)
+        v = v.reshape((TILE_N, TILE_D))
+
+        # Compute Q @ K^T: [TILE_M, TILE_N]
+        k_t = k.permute((1, 0))  # [TILE_D, TILE_N]
+        qk = ct.full((TILE_M, TILE_N), 0.0, dtype=ct.float32)
+        qk = ct.mma(q, k_t, qk)  # [TILE_M, TILE_N]
+
+        # Compute P = softmax(QK^T * scale)
+        p = ct.exp2(qk * qk_scale_log2 - lse, flush_to_zero=True)  # [TILE_M, TILE_N]
+
+        # Apply causal mask
+        if CAUSAL:
+            mask = offs_m >= offs_n  # [TILE_M, TILE_N]: q_pos >= k_pos
+            p = ct.where(mask, p, 0.0)
+
+        # Compute dP = dO @ V^T: [TILE_M, TILE_N]
+        v_t = v.permute((1, 0))  # [TILE_D, TILE_N]
+        dp = ct.full((TILE_M, TILE_N), 0.0, dtype=ct.float32)
+        dp = ct.mma(do, v_t, dp)  # [TILE_M, TILE_N]
+
+        # Compute dS = P * (dP - Delta)
+        ds = p * (dp - delta)  # [TILE_M, TILE_N]
+
+        # Compute dQ += dS @ K
+        ds_cast = ds.astype(Q.dtype)
+        dq_acc = ct.mma(ds_cast, k, dq_acc)  # [TILE_M, TILE_D]
+
+    # Apply scale to dQ
+    dq_acc = dq_acc * qk_scale
+
+    # Store dQ using tile-based indexing
+    dq_store = dq_acc.reshape((1, 1, TILE_M, TILE_D)).astype(dQ.dtype)
+    ct.store(dQ, index=(batch_idx, head_idx, bid_m, 0), tile=dq_store)
+
+
+def _fmha_autotune_configs():
+    """
+    Iterator of autotune configurations for FMHA forward kernel.
+
+    Only tunes tile sizes; num_ctas and occupancy are left to the compiler.
+
+    Search dimensions:
+    - TILE_M: [64, 128, 256] (Q tile)
+    - TILE_N: [32, 64, 128] (K/V tile)
+    """
+    tile_ms = [64, 128, 256]
+    tile_ns = [32, 64, 128]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            yield SimpleNamespace(TILE_M=tm, TILE_N=tn)
+
+
+def cutile_autotune_fmha(
+    stream,
+    q,
+    k,
+    v,
+    o,
+    sm_scale,
+    input_pos,
+    hidden_size,
+    num_heads,
+    query_group_size,
+    is_causal,
+    EVEN_K,
+):
+    batch_size, _, q_len, _ = q.shape
+    ct_experimental.autotune_launch(
+        stream,
+        grid_fn=lambda cfg: (
+            math.ceil(q_len / cfg.TILE_M),
+            batch_size * num_heads,
+            1,
+        ),
+        kernel=fmha_kernel,
+        args_fn=lambda cfg: (
+            q,
+            k,
+            v,
+            o,
+            sm_scale,
+            input_pos,
+            hidden_size,
+            num_heads,
+            cfg.TILE_M,
+            cfg.TILE_N,
+            query_group_size,
+            is_causal,
+            EVEN_K,
+        ),
+        search_space=_fmha_autotune_configs,
+        max_iter=20,
+    )
+    return o
+
+
+def tile_prefill_fmha(q, k, v, sm_scale, is_causal=True, kernel_configs=None):
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(q.size(-1))
+
+    batch_size, num_heads, q_len, hidden_size = q.shape
+    _, num_head_kv, k_len, _ = k.shape
+
+    assert num_heads % num_head_kv == 0
+    query_group_size = num_heads // num_head_kv
+
+    q = q.contiguous() if not q.is_contiguous() else q
+    k = k.contiguous() if not k.is_contiguous() else k
+    v = v.contiguous() if not v.is_contiguous() else v
+    o = torch.empty_like(q)
+
+    input_pos = 0  # prefill, causal
+
+    max_tile_n = max(cfg.TILE_N for cfg in _fmha_autotune_configs())
+    EVEN_K = (k_len % max_tile_n) == 0
+    return cutile_autotune_fmha(
+        torch.cuda.current_stream(),
+        q,
+        k,
+        v,
+        o,
+        sm_scale,
+        input_pos,
+        hidden_size,
+        num_heads,
+        query_group_size,
+        is_causal,
+        EVEN_K,
+    )
+
+
+def tile_fmha(
+    q,
+    k,
+    v,
+    scaling=None,
+    is_causal=True,
+    **kwargs,
+):
+    if scaling is None:
+        scaling = 1.0 / math.sqrt(q.size(-1))
+    kernel_configs = kwargs.get("kernel_configs", None)
+    o = tile_prefill_fmha(q, k, v, scaling, is_causal, kernel_configs)
+    return o
+
+
 # --- Backward Pass Autotune Configs ---
-def _fmha_bwd_autotune_configs():
+def _fmha_bwd_autotune_configs(hidden_size: int | None = None):
     """Reference configs for FMHA backward (used for padding/preprocess only).
 
     The actual autotuning is done by _fmha_bwd_dkdv_autotune_configs and
@@ -662,15 +1012,19 @@ def _fmha_bwd_autotune_configs():
     tile sizes for padding calculation.
     """
     # All possible TILE_M and TILE_N values used across dKdV and dQ configs
-    tile_ms = [32, 64, 128]
-    tile_ns = [32, 64, 128]
+    if hidden_size is not None and hidden_size >= 128:
+        tile_ms = [32, 64, 128, 256]
+        tile_ns = [64, 128]
+    else:
+        tile_ms = [32, 64, 128]
+        tile_ns = [32, 64, 128]
     # Only need one entry per unique (TILE_M, TILE_N) for padding calculation
     for tm in tile_ms:
         for tn in tile_ns:
             yield SimpleNamespace(TILE_M=tm, TILE_N=tn)
 
 
-def _fmha_bwd_dkdv_autotune_configs():
+def _fmha_bwd_dkdv_autotune_configs(hidden_size: int | None = None):
     """Autotune configurations for dK/dV kernel.
 
     Only tunes tile sizes; num_ctas and occupancy are left to the compiler.
@@ -679,15 +1033,19 @@ def _fmha_bwd_dkdv_autotune_configs():
     - TILE_M: [32, 64, 128] (Q tile, inner loop)
     - TILE_N: [64, 128] (K/V tile, this block's tile)
     """
-    tile_ms = [32, 64, 128]
-    tile_ns = [64, 128]
+    if hidden_size is not None and hidden_size >= 128:
+        tile_ms = [32, 64, 128, 256]
+        tile_ns = [64, 128]
+    else:
+        tile_ms = [32, 64, 128]
+        tile_ns = [64, 128]
 
     for tm in tile_ms:
         for tn in tile_ns:
             yield SimpleNamespace(TILE_M=tm, TILE_N=tn)
 
 
-def _fmha_bwd_dq_autotune_configs():
+def _fmha_bwd_dq_autotune_configs(hidden_size: int | None = None):
     """Autotune configurations for dQ kernel.
 
     Only tunes tile sizes; num_ctas and occupancy are left to the compiler.
@@ -696,8 +1054,12 @@ def _fmha_bwd_dq_autotune_configs():
     - TILE_M: [64, 128] (Q tile, this block's tile)
     - TILE_N: [32, 64, 128] (K/V tile, inner loop)
     """
-    tile_ms = [64, 128]
-    tile_ns = [32, 64, 128]
+    if hidden_size is not None and hidden_size >= 128:
+        tile_ms = [32, 64, 128, 256]
+        tile_ns = [32, 64, 128]
+    else:
+        tile_ms = [64, 128]
+        tile_ns = [32, 64, 128]
 
     for tm in tile_ms:
         for tn in tile_ns:
@@ -831,7 +1193,7 @@ def fmha_backward(
     TILE_D = next_power_of_2(hidden_size)
 
     # Get max tile size from configs for padding calculation
-    all_configs = list(_fmha_bwd_autotune_configs())
+    all_configs = list(_fmha_bwd_autotune_configs(hidden_size))
     max_tile_m = max(cfg.TILE_M for cfg in all_configs)
     max_tile_n = max(cfg.TILE_N for cfg in all_configs)
 
@@ -843,7 +1205,8 @@ def fmha_backward(
 
     # Pad and flatten LSE for gather operations
     if q_len != padded_q_len:
-        lse_padded = torch.full((batch_size, num_heads, padded_q_len), float('inf'), dtype=torch.float32, device=q.device)
+        lse_padded = torch.full((batch_size, num_heads, padded_q_len), float("inf"),
+                                dtype=torch.float32, device=q.device)
         lse_padded[:, :, :q_len] = lse
         lse_flat = lse_padded.view(-1).contiguous()
     else:
@@ -867,6 +1230,7 @@ def fmha_backward(
     )
 
     # Step 2: Compute dK and dV with autotuning
+    dkdv_kernel = fmha_bwd_dkdv_kernel_occ1 if hidden_size >= 128 else fmha_bwd_dkdv_kernel
     ct_experimental.autotune_launch(
         stream,
         grid_fn=lambda cfg: (
@@ -874,17 +1238,18 @@ def fmha_backward(
             batch_size * num_head_kv,
             1,
         ),
-        kernel=fmha_bwd_dkdv_kernel,
+        kernel=dkdv_kernel,
         args_fn=lambda cfg: (
             q, k, v, do, dk, dv, lse_flat, delta_flat,
             sm_scale, TILE_D, num_heads, num_head_kv, padded_q_len,
             cfg.TILE_M, cfg.TILE_N, query_group_size, is_causal,
         ),
-        search_space=_fmha_bwd_dkdv_autotune_configs,
+        search_space=lambda: _fmha_bwd_dkdv_autotune_configs(hidden_size),
         max_iter=20,
     )
 
     # Step 3: Compute dQ with autotuning
+    dq_kernel = fmha_bwd_dq_kernel_occ1 if hidden_size >= 128 else fmha_bwd_dq_kernel
     ct_experimental.autotune_launch(
         stream,
         grid_fn=lambda cfg: (
@@ -892,13 +1257,13 @@ def fmha_backward(
             batch_size * num_heads,
             1,
         ),
-        kernel=fmha_bwd_dq_kernel,
+        kernel=dq_kernel,
         args_fn=lambda cfg: (
             q, k, v, do, dq, lse_flat, delta_flat,
             sm_scale, TILE_D, num_heads, padded_q_len,
             cfg.TILE_M, cfg.TILE_N, query_group_size, is_causal,
         ),
-        search_space=_fmha_bwd_dq_autotune_configs,
+        search_space=lambda: _fmha_bwd_dq_autotune_configs(hidden_size),
         max_iter=20,
     )
 
