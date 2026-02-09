@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 import math
+import os
 from types import SimpleNamespace
 
 import cuda.tile as ct
@@ -23,6 +24,15 @@ LN2 = math.log(2)
 # Define type aliases for Constant integers and booleans
 ConstInt = ct.Constant[int]
 ConstBool = ct.Constant[bool]
+
+
+def _should_disable_autotune():
+    """Check if autotuning should be disabled (for testing).
+
+    Set DISABLE_AUTOTUNE=1 to skip autotuning and use the first config.
+    This is useful for CI testing where autotuning can cause timeouts.
+    """
+    return os.environ.get("DISABLE_AUTOTUNE", "0") == "1"
 
 
 # --- FMHA Forward Kernel (for inference, no backward) ---
@@ -642,32 +652,48 @@ def cutile_autotune_fmha(
     EVEN_K,
 ):
     batch_size, _, q_len, _ = q.shape
-    ct_experimental.autotune_launch(
-        stream,
-        grid_fn=lambda cfg: (
-            math.ceil(q_len / cfg.TILE_M),
-            batch_size * num_heads,
-            1,
-        ),
-        kernel=fmha_kernel,
-        args_fn=lambda cfg: (
-            q,
-            k,
-            v,
-            o,
-            sm_scale,
-            input_pos,
-            hidden_size,
-            num_heads,
-            cfg.TILE_M,
-            cfg.TILE_N,
-            query_group_size,
-            is_causal,
-            EVEN_K,
-        ),
-        search_space=lambda: _fmha_autotune_configs(hidden_size),
-        max_iter=20,
-    )
+
+    if _should_disable_autotune():
+        # Use first config without autotuning for faster CI testing
+        configs = list(_fmha_autotune_configs(hidden_size))
+        cfg = configs[0]
+        grid = (math.ceil(q_len / cfg.TILE_M), batch_size * num_heads, 1)
+        ct.launch(
+            stream,
+            grid,
+            fmha_kernel,
+            (
+                q, k, v, o, sm_scale, input_pos, hidden_size, num_heads,
+                cfg.TILE_M, cfg.TILE_N, query_group_size, is_causal, EVEN_K,
+            ),
+        )
+    else:
+        ct_experimental.autotune_launch(
+            stream,
+            grid_fn=lambda cfg: (
+                math.ceil(q_len / cfg.TILE_M),
+                batch_size * num_heads,
+                1,
+            ),
+            kernel=fmha_kernel,
+            args_fn=lambda cfg: (
+                q,
+                k,
+                v,
+                o,
+                sm_scale,
+                input_pos,
+                hidden_size,
+                num_heads,
+                cfg.TILE_M,
+                cfg.TILE_N,
+                query_group_size,
+                is_causal,
+                EVEN_K,
+            ),
+            search_space=lambda: _fmha_autotune_configs(hidden_size),
+            max_iter=20,
+        )
     return o
 
 
@@ -930,67 +956,99 @@ def fmha_backward(
         (o, do, delta_flat, preprocess_tile_m, TILE_D, num_heads, padded_q_len),
     )
 
-    # Step 2: Compute dK and dV with autotuning
-    ct_experimental.autotune_launch(
-        stream,
-        grid_fn=lambda cfg: (
-            math.ceil(k_len / cfg.TILE_N),
-            batch_size * num_head_kv,
-            1,
-        ),
-        kernel=fmha_bwd_dkdv_kernel,
-        args_fn=lambda cfg: (
-            q,
-            k,
-            v,
-            do,
-            dk,
-            dv,
-            lse_flat,
-            delta_flat,
-            sm_scale,
-            TILE_D,
-            num_heads,
-            num_head_kv,
-            padded_q_len,
-            cfg.TILE_M,
-            cfg.TILE_N,
-            query_group_size,
-            is_causal,
-        ),
-        search_space=lambda: _fmha_bwd_dkdv_autotune_configs(hidden_size),
-        max_iter=20,
-    )
+    # Step 2: Compute dK and dV
+    if _should_disable_autotune():
+        # Use first config without autotuning for faster CI testing
+        dkdv_configs = list(_fmha_bwd_dkdv_autotune_configs(hidden_size))
+        cfg = dkdv_configs[0]
+        grid = (math.ceil(k_len / cfg.TILE_N), batch_size * num_head_kv, 1)
+        ct.launch(
+            stream,
+            grid,
+            fmha_bwd_dkdv_kernel,
+            (
+                q, k, v, do, dk, dv, lse_flat, delta_flat,
+                sm_scale, TILE_D, num_heads, num_head_kv, padded_q_len,
+                cfg.TILE_M, cfg.TILE_N, query_group_size, is_causal,
+            ),
+        )
+    else:
+        ct_experimental.autotune_launch(
+            stream,
+            grid_fn=lambda cfg: (
+                math.ceil(k_len / cfg.TILE_N),
+                batch_size * num_head_kv,
+                1,
+            ),
+            kernel=fmha_bwd_dkdv_kernel,
+            args_fn=lambda cfg: (
+                q,
+                k,
+                v,
+                do,
+                dk,
+                dv,
+                lse_flat,
+                delta_flat,
+                sm_scale,
+                TILE_D,
+                num_heads,
+                num_head_kv,
+                padded_q_len,
+                cfg.TILE_M,
+                cfg.TILE_N,
+                query_group_size,
+                is_causal,
+            ),
+            search_space=lambda: _fmha_bwd_dkdv_autotune_configs(hidden_size),
+            max_iter=20,
+        )
 
-    # Step 3: Compute dQ with autotuning
-    ct_experimental.autotune_launch(
-        stream,
-        grid_fn=lambda cfg: (
-            math.ceil(q_len / cfg.TILE_M),
-            batch_size * num_heads,
-            1,
-        ),
-        kernel=fmha_bwd_dq_kernel,
-        args_fn=lambda cfg: (
-            q,
-            k,
-            v,
-            do,
-            dq,
-            lse_flat,
-            delta_flat,
-            sm_scale,
-            TILE_D,
-            num_heads,
-            padded_q_len,
-            cfg.TILE_M,
-            cfg.TILE_N,
-            query_group_size,
-            is_causal,
-        ),
-        search_space=lambda: _fmha_bwd_dq_autotune_configs(hidden_size),
-        max_iter=20,
-    )
+    # Step 3: Compute dQ
+    if _should_disable_autotune():
+        # Use first config without autotuning for faster CI testing
+        dq_configs = list(_fmha_bwd_dq_autotune_configs(hidden_size))
+        cfg = dq_configs[0]
+        grid = (math.ceil(q_len / cfg.TILE_M), batch_size * num_heads, 1)
+        ct.launch(
+            stream,
+            grid,
+            fmha_bwd_dq_kernel,
+            (
+                q, k, v, do, dq, lse_flat, delta_flat,
+                sm_scale, TILE_D, num_heads, padded_q_len,
+                cfg.TILE_M, cfg.TILE_N, query_group_size, is_causal,
+            ),
+        )
+    else:
+        ct_experimental.autotune_launch(
+            stream,
+            grid_fn=lambda cfg: (
+                math.ceil(q_len / cfg.TILE_M),
+                batch_size * num_heads,
+                1,
+            ),
+            kernel=fmha_bwd_dq_kernel,
+            args_fn=lambda cfg: (
+                q,
+                k,
+                v,
+                do,
+                dq,
+                lse_flat,
+                delta_flat,
+                sm_scale,
+                TILE_D,
+                num_heads,
+                padded_q_len,
+                cfg.TILE_M,
+                cfg.TILE_N,
+                query_group_size,
+                is_causal,
+            ),
+            search_space=lambda: _fmha_bwd_dq_autotune_configs(hidden_size),
+            max_iter=20,
+        )
 
     return dq, dk, dv
 
