@@ -3,8 +3,7 @@
 """
 Performance benchmarks for Flash Attention: CuTile vs Triton Flash Attention.
 
-Self-contained Triton fused attention kernel (copied from a Triton example and
-trimmed for benchmarking). No external TRITON_FUSED_ATTN_PATH is required.
+Self-contained Triton fused attention kernel (copied from Triton official tutorial https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html). 
 """
 
 import math
