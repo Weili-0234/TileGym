@@ -15,6 +15,7 @@ import triton
 
 from tilegym.backend import is_backend_available
 from tilegym.ops.cutile.rms_norm import TileRMSNorm
+from tilegym.ops.cutile.rms_norm import _bwd_tiles
 from tilegym.ops.cutile.rms_norm import rms_norm_backward
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -116,7 +117,11 @@ def bench_rmsnorm_backward(N, backend, dtype, M, device=DEVICE):
     dx_bytes = x.numel() * bytes_per_element  # Write dx
     dw_bytes = weight.numel() * bytes_per_element  # Write dw
 
-    temp_buffer_bytes = x.numel() * 4 * 2  # always write + read float32
+    if backend == "cutile":
+        _, tile_n, grid, _ = _bwd_tiles(M, N)
+        temp_buffer_bytes = grid * tile_n * 4 * 2  # partial-sum buffer: write + read float32
+    else:
+        temp_buffer_bytes = 0
 
     total_bytes = input_x_bytes + dy_bytes + weight_bytes + rstd_bytes + dx_bytes + dw_bytes + temp_buffer_bytes
 
