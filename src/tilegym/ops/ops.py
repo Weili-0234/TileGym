@@ -332,6 +332,51 @@ def fmha(
 
 
 @dispatch(
+    "nsa",
+)
+def nsa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g_cmp: torch.Tensor,
+    g_slc: torch.Tensor,
+    g_swa: torch.Tensor,
+    block_size: int = 64,
+    block_count: int = 16,
+    window_size: int = 512,
+    scale: Optional[float] = None,
+    **kwargs: Any,
+):
+    """
+    Native Sparse Attention (NSA) forward pass.
+
+    Combines three attention branches:
+    - Compression attention over mean-pooled K/V
+    - Selection attention over top-K chosen blocks
+    - Sliding window causal attention
+
+    The three outputs are fused via sigmoid gates.
+
+    Args:
+        q: Query tensor of shape (B, HQ, S, D)
+        k: Key tensor of shape (B, G, S, D) where G = number of KV heads
+        v: Value tensor of shape (B, G, S, D)
+        g_cmp: Compression gate of shape (B, HQ, S), pre-sigmoid
+        g_slc: Selection gate of shape (B, HQ, S), pre-sigmoid
+        g_swa: Sliding window gate of shape (B, HQ, S), pre-sigmoid
+        block_size: Block size for compression and selection (default: 64)
+        block_count: Number of top-K blocks to select (default: 16)
+        window_size: Sliding window size (default: 512)
+        scale: Scale factor for attention scores (default: 1/sqrt(D))
+        **kwargs: Additional backend-specific arguments
+
+    Returns:
+        Output tensor of shape (B, HQ, S, D)
+    """
+    raise NotImplementedError(f"nsa is not implemented for {get_current_backend()}")
+
+
+@dispatch(
     "fmha_decode",
 )
 def fmha_decode(
