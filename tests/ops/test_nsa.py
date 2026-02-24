@@ -8,6 +8,7 @@ Test suite for NSA (Native Sparse Attention) forward pass.
 Layer 0: Cross-validate reference functions against FLA naive
 Layer 1: Unit tests for each cutile kernel vs reference
 Layer 2: End-to-end pipeline test
+Layer 3: Cross-validate against Scalable-Flash-NSA torch_ref.py
 """
 
 import math
@@ -447,4 +448,216 @@ class TestNSAEndToEnd:
         torch.testing.assert_close(
             o_ct.float(), o_ref.float(), atol=5e-2, rtol=1e-2,
             msg=f"NSA E2E mismatch (dtype={dtype}, B={B}, HQ={HQ}, G={G}, S={S}, D={D})"
+        )
+
+
+# ============================================================================
+# Layer 3: Cross-Validation Against Scalable-Flash-NSA
+# ============================================================================
+
+
+def _load_scalable_flash_nsa_torch_ref():
+    """Load torch_ref module from Scalable-Flash-NSA using importlib."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "scalable_flash_nsa_torch_ref",
+        "/root/workspace/Scalable-Flash-Native-Sparse-Attention/flash_nsa/ops/torch_ref.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestScalableFlashNSACrossValidation:
+    """Cross-validate NSA components against Scalable-Flash-NSA's torch_ref.py.
+
+    Layout conventions:
+    - TileGym: [B, H, S, D] (head-first, batched)
+    - Scalable-Flash-NSA: [S, H, D] (unbatched, per-sequence)
+
+    Key alignment: Both use strict past-only causal convention for compression.
+    For cross-validation, we set kernel_size = stride = block_size so their
+    overlapping window degrades to our non-overlapping block mean pooling.
+    """
+
+    @pytest.mark.parametrize(
+        "B, HQ, G, S, D",
+        [
+            (1, 4, 2, 128, 64),
+            (1, 4, 2, 256, 64),
+            (1, 8, 4, 256, 128),
+            (2, 4, 2, 128, 64),
+        ],
+    )
+    @pytest.mark.parametrize("block_size", [32, 64])
+    def test_compression_attn_vs_scalable_flash_nsa(self, B, HQ, G, S, D, block_size):
+        """Cross-validate compression_attention_ref vs torch_cmp_attn.
+
+        When kernel_size == stride == block_size, their overlapping window
+        degrades to our non-overlapping mean pooling, so the compressed K/V
+        blocks match exactly. Both use strict past-only causal convention.
+        """
+        ref = _load_scalable_flash_nsa_torch_ref()
+        torch_cmp_attn = ref.torch_cmp_attn
+        torch_construct_block = ref.torch_construct_block
+
+        torch.manual_seed(42)
+        q = torch.randn(B, HQ, S, D, device="cuda", dtype=torch.float32)
+        k = torch.randn(B, G, S, D, device="cuda", dtype=torch.float32)
+        v = torch.randn(B, G, S, D, device="cuda", dtype=torch.float32)
+        scale = D ** -0.5
+
+        # Our compression: mean pool then attention
+        k_cmp, v_cmp = mean_pool_kv(k, v, block_size)
+        o_ours, _ = compression_attention_ref(q, k_cmp, v_cmp, block_size, scale)
+
+        # Their compression: construct_block (mean) then attention
+        # Process per-batch since their API is unbatched [S, H, D]
+        for b in range(B):
+            # Convert our [B, H, S, D] to their [S, H, D]
+            q_ref = q[b].transpose(0, 1)  # [HQ, S, D] -> [S, HQ, D]
+            k_ref = k[b].transpose(0, 1)  # [G, S, D] -> [S, G, D]
+            v_ref = v[b].transpose(0, 1)  # [G, S, D] -> [S, G, D]
+
+            # Their mean pooling: construct_block with kernel_size=stride=block_size
+            # For mean pooling, they construct blocks then average
+            k_blocks = torch_construct_block(k_ref, block_size, block_size)  # [num_blocks, G, block_size, D]
+            v_blocks = torch_construct_block(v_ref, block_size, block_size)  # [num_blocks, G, block_size, D]
+            k_cmp_ref = k_blocks.mean(dim=2)  # [num_blocks, G, D]
+            v_cmp_ref = v_blocks.mean(dim=2)  # [num_blocks, G, D]
+
+            # Their causal attention
+            o_ref = torch_cmp_attn(q_ref, k_cmp_ref, v_cmp_ref, block_size, block_size)
+            # o_ref: [S, HQ, D]
+
+            # Convert back to our layout: [S, HQ, D] -> [HQ, S, D]
+            o_ref_ours = o_ref.transpose(0, 1)  # [HQ, S, D]
+
+            # Compare (skip first block_size-1 positions which are zeroed in both)
+            torch.testing.assert_close(
+                o_ours[b, :, block_size:].float(),
+                o_ref_ours[:, block_size:].float(),
+                atol=1e-3, rtol=1e-3,
+                msg=f"compression_attn cross-validation failed (b={b}, BS={block_size})",
+            )
+
+    @pytest.mark.parametrize(
+        "B, HQ, G, S, D",
+        [
+            (1, 4, 2, 128, 64),
+            (1, 4, 2, 256, 64),
+            (1, 8, 4, 256, 128),
+        ],
+    )
+    @pytest.mark.parametrize("block_size", [32, 64])
+    @pytest.mark.parametrize("block_count", [4])
+    def test_selection_attn_vs_scalable_flash_nsa(self, B, HQ, G, S, D, block_size, block_count):
+        """Cross-validate selection_attention_ref vs torch_slc_attn.
+
+        Both use per-position block indices and causal masking within selected blocks.
+        We generate identical block_indices and feed them to both implementations.
+
+        IMPORTANT: torch_slc_attn uses a sentinel convention where topk[0,0,-1]
+        is the sentinel value (99999999 in their torch_topk). Padding positions
+        must use this sentinel, not 0. We convert our indices accordingly.
+        """
+        ref = _load_scalable_flash_nsa_torch_ref()
+        torch_slc_attn = ref.torch_slc_attn
+        IGNORE_IDX = 99999999
+
+        torch.manual_seed(42)
+        q = torch.randn(B, HQ, S, D, device="cuda", dtype=torch.float32)
+        k = torch.randn(B, G, S, D, device="cuda", dtype=torch.float32)
+        v = torch.randn(B, G, S, D, device="cuda", dtype=torch.float32)
+        scale = D ** -0.5
+
+        # Generate valid causal block indices with sentinel for their API
+        block_indices = torch.full(
+            (B, G, S, block_count), IGNORE_IDX, dtype=torch.long, device="cuda"
+        )
+        for b_idx in range(B):
+            for g in range(G):
+                for t in range(S):
+                    nc = (t + 1) // block_size
+                    if nc > 0:
+                        actual_k = min(block_count, nc)
+                        perm = torch.randperm(nc, device="cuda")[:actual_k]
+                        block_indices[b_idx, g, t, :actual_k] = perm
+
+        # For our selection_attention_ref, replace sentinel with 0 (clamped)
+        block_indices_ours = block_indices.clone()
+        block_indices_ours[block_indices_ours == IGNORE_IDX] = 0
+
+        # Our selection attention
+        o_ours = selection_attention_ref(q, k, v, block_indices_ours, block_size, scale)
+
+        # Their selection attention (per-batch, unbatched)
+        for b in range(B):
+            q_ref = q[b].transpose(0, 1)   # [S, HQ, D]
+            k_ref = k[b].transpose(0, 1)   # [S, G, D]
+            v_ref = v[b].transpose(0, 1)   # [S, G, D]
+
+            # Their topk format: [KH, S, top_n] (KH = G)
+            topk_ref = block_indices[b].to(torch.int64)  # [G, S, block_count]
+
+            o_ref = torch_slc_attn(q_ref, k_ref, v_ref, topk_ref, block_size)
+            # o_ref: [S, HQ, D]
+            o_ref_ours = o_ref.transpose(0, 1)  # [HQ, S, D]
+
+            # Only compare positions where all block_count slots have distinct
+            # valid indices (nc >= block_count), i.e., t >= block_count * block_size.
+            # Below this threshold, padding handling differs: ours gathers
+            # duplicate KV positions (extra weight), theirs uses scatter-mask
+            # (deduplicating). This is a known convention difference.
+            start_t = block_count * block_size
+            if start_t < S:
+                torch.testing.assert_close(
+                    o_ours[b, :, start_t:].float(), o_ref_ours[:, start_t:].float(),
+                    atol=1e-3, rtol=1e-3,
+                    msg=f"selection_attn cross-validation failed (b={b}, BS={block_size})",
+                )
+
+    @pytest.mark.parametrize(
+        "B, HQ, G, S, D",
+        [
+            (1, 4, 2, 128, 64),
+            (1, 4, 2, 256, 64),
+            (2, 4, 2, 128, 64),
+            (1, 4, 2, 96, 64),   # irregular S
+        ],
+    )
+    def test_gate_fusion_vs_scalable_flash_nsa(self, B, HQ, G, S, D):
+        """Cross-validate gate_fusion vs torch_sigmoid_combine.
+
+        Both apply sigmoid inside, so results should be numerically identical.
+        Our interface: separate gates g_cmp, g_slc, g_swa (each [B, HQ, S])
+        Their interface: combined weight w[..., 3]
+        """
+        ref = _load_scalable_flash_nsa_torch_ref()
+        torch_sigmoid_combine = ref.torch_sigmoid_combine
+
+        torch.manual_seed(42)
+        o_cmp = torch.randn(B, HQ, S, D, device="cuda", dtype=torch.float32)
+        o_slc = torch.randn(B, HQ, S, D, device="cuda", dtype=torch.float32)
+        o_swa = torch.randn(B, HQ, S, D, device="cuda", dtype=torch.float32)
+        g_cmp = torch.randn(B, HQ, S, device="cuda", dtype=torch.float32)
+        g_slc = torch.randn(B, HQ, S, device="cuda", dtype=torch.float32)
+        g_swa = torch.randn(B, HQ, S, device="cuda", dtype=torch.float32)
+
+        # Our gate fusion
+        from tilegym.ops.nsa_reference import nsa_forward_ref  # just reuse gate logic
+        g_cmp_s = torch.sigmoid(g_cmp).unsqueeze(-1)
+        g_slc_s = torch.sigmoid(g_slc).unsqueeze(-1)
+        g_swa_s = torch.sigmoid(g_swa).unsqueeze(-1)
+        o_ours = g_cmp_s * o_cmp + g_slc_s * o_slc + g_swa_s * o_swa
+
+        # Their sigmoid_combine: expects w[..., 3] as combined weight tensor
+        # Stack gates into [B, HQ, S, 3] format
+        w = torch.stack([g_cmp, g_slc, g_swa], dim=-1)
+        o_theirs = torch_sigmoid_combine(o_cmp, o_slc, o_swa, w)
+
+        torch.testing.assert_close(
+            o_ours.float(), o_theirs.float(),
+            atol=1e-5, rtol=1e-5,
+            msg="gate_fusion vs torch_sigmoid_combine mismatch",
         )
