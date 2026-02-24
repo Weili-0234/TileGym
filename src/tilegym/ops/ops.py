@@ -377,6 +377,38 @@ def nsa(
 
 
 @dispatch(
+    "topk_block_selection",
+)
+def topk_block_selection(
+    importance: torch.Tensor,
+    block_size: int,
+    block_count: int,
+    num_init: int = 0,
+    num_local: int = 0,
+    **kwargs: Any,
+):
+    """
+    Top-K block selection from pre-computed importance scores.
+
+    Uses iterative argmax with support for reserved initial and local blocks
+    (matching Scalable-Flash-NSA's design).
+
+    Args:
+        importance: Importance scores of shape (B, G, S, Tc) where
+            Tc = ceil(S / block_size) is the number of compressed blocks
+        block_size: Block size for causal boundary computation
+        block_count: Number of blocks to select per query position
+        num_init: Number of initial blocks to always include (default: 0)
+        num_local: Number of local (nearest) blocks to always include (default: 0)
+        **kwargs: Additional backend-specific arguments
+
+    Returns:
+        Block indices tensor of shape (B, G, S, block_count)
+    """
+    raise NotImplementedError(f"topk_block_selection is not implemented for {get_current_backend()}")
+
+
+@dispatch(
     "fmha_decode",
 )
 def fmha_decode(

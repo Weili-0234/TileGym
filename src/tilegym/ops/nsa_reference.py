@@ -158,6 +158,75 @@ def topk_block_selection_ref(q, k_cmp, lse_cmp, block_size, block_count, scale=N
     return indices
 
 
+def topk_from_importance_ref(importance, block_size, block_count, num_init=0, num_local=0):
+    """
+    Top-K block selection from pre-computed importance scores.
+
+    Standalone reference for the @dispatch("topk_block_selection") op.
+    Supports reserved initial and local blocks (matching Scalable-Flash-NSA).
+
+    Args:
+        importance: [B, G, S, Tc] — pre-computed importance scores
+        block_size: int — block size for causal boundary computation
+        block_count: int — number of blocks to select
+        num_init: int — number of initial blocks to always include (default: 0)
+        num_local: int — number of local (nearest) blocks to always include (default: 0)
+
+    Returns:
+        block_indices: [B, G, S, block_count]
+    """
+    B, G, S, Tc = importance.shape
+    device = importance.device
+
+    importance = importance.float().clone()
+
+    # Block-level causal mask
+    query_pos = torch.arange(S, device=device).view(1, 1, S, 1)
+    block_idx = torch.arange(Tc, device=device).view(1, 1, 1, Tc)
+    causal_mask = block_idx < (query_pos + 1) // block_size
+    importance = importance.masked_fill(~causal_mask, float("-inf"))
+
+    # Output indices
+    indices = torch.zeros(B, G, S, block_count, dtype=torch.long, device=device)
+
+    for b in range(B):
+        for g in range(G):
+            for s in range(S):
+                imp = importance[b, g, s].clone()  # [Tc]
+                slot = 0
+
+                # Phase 1: Force-include initial blocks
+                for i in range(num_init):
+                    if slot >= block_count:
+                        break
+                    if i < Tc:
+                        indices[b, g, s, slot] = i
+                        imp[i] = float("-inf")  # exclude from further selection
+                        slot += 1
+
+                # Phase 2: Force-include local (nearest) blocks
+                current_block = s // block_size
+                for i in range(num_local):
+                    if slot >= block_count:
+                        break
+                    local_idx = current_block - i
+                    if 0 <= local_idx < Tc and local_idx < (s + 1) // block_size:
+                        indices[b, g, s, slot] = local_idx
+                        imp[local_idx] = float("-inf")
+                        slot += 1
+
+                # Phase 3: Iterative argmax for remaining slots
+                while slot < block_count:
+                    if imp.max() == float("-inf"):
+                        break  # no more valid blocks
+                    idx = imp.argmax()
+                    indices[b, g, s, slot] = idx
+                    imp[idx] = float("-inf")
+                    slot += 1
+
+    return indices
+
+
 def selection_attention_ref(q, k, v, block_indices, block_size, scale=None):
     """
     Selection attention: attend to selected K/V blocks per query position.
