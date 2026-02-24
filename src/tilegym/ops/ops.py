@@ -377,6 +377,37 @@ def nsa(
 
 
 @dispatch(
+    "sliding_window_attention",
+)
+def sliding_window_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    window_size: int = 512,
+    scale: Optional[float] = None,
+    **kwargs: Any,
+):
+    """
+    Sliding window causal attention.
+
+    Each query at position t attends to positions [max(0, t-window_size+1), t].
+    Supports Grouped Query Attention (GQA) where HQ query heads share G KV heads.
+
+    Args:
+        q: Query tensor of shape (B, HQ, S, D)
+        k: Key tensor of shape (B, G, S, D) where G = number of KV heads
+        v: Value tensor of shape (B, G, S, D)
+        window_size: Sliding window size (default: 512)
+        scale: Scale factor for attention scores (default: 1/sqrt(D))
+        **kwargs: Additional backend-specific arguments
+
+    Returns:
+        Output tensor of shape (B, HQ, S, D)
+    """
+    raise NotImplementedError(f"sliding_window_attention is not implemented for {get_current_backend()}")
+
+
+@dispatch(
     "fmha_decode",
 )
 def fmha_decode(
