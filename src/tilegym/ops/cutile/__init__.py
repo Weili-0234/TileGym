@@ -29,6 +29,7 @@ if is_backend_available("cutile"):
     from . import mla_decoding_split_kv
     from . import moe
     from . import nsa
+    from . import selection_attention
     from . import moe_align_block
     from . import rms_norm
     from . import rope
@@ -84,6 +85,7 @@ if is_backend_available("cutile"):
         "moe",
         "moe_align_block",
         "nsa",
+        "selection_attention",
         "rope",
         "swiglu",
         "apply_rope_base",

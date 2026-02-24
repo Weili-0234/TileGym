@@ -377,6 +377,41 @@ def nsa(
 
 
 @dispatch(
+    "selection_attention",
+)
+def selection_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_indices: torch.Tensor,
+    block_size: int,
+    block_count: int,
+    scale: Optional[float] = None,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """
+    Selection attention: attend to selected K/V blocks per query position.
+
+    Each query attends only to K/V tokens within the blocks specified by
+    block_indices, with causal masking within each block.
+
+    Args:
+        q: Query tensor of shape (B, HQ, S, D)
+        k: Key tensor of shape (B, G, S, D) where G = number of KV heads
+        v: Value tensor of shape (B, G, S, D)
+        block_indices: Block index tensor of shape (B, G, S, block_count)
+        block_size: Size of each K/V block
+        block_count: Number of blocks per query position
+        scale: Scale factor for attention scores (default: 1/sqrt(D))
+        **kwargs: Additional backend-specific arguments
+
+    Returns:
+        Output tensor of shape (B, HQ, S, D)
+    """
+    raise NotImplementedError(f"selection_attention is not implemented for {get_current_backend()}")
+
+
+@dispatch(
     "fmha_decode",
 )
 def fmha_decode(
