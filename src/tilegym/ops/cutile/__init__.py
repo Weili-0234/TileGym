@@ -40,9 +40,11 @@ if is_backend_available("cutile"):
     from .attention_sink import attention_sink
     from .attention_sink_decode import attention_sink_decode
     from .experimental import mhc
+    from .experimental import sliding_window_attention as experimental_sliding_window_attention
     from .experimental.mhc import mhc_apply_residual
     from .experimental.mhc import mhc_gemm_rms_scale
     from .experimental.mhc import mhc_sinkhorn
+    from .experimental.sliding_window_attention import sliding_window_attention
     from .flash_decode import fmha_decode
     from .moe import fused_moe_kernel as invoke_fused_moe_kernel
     from .moe_align_block import moe_align_block_size
@@ -82,6 +84,7 @@ if is_backend_available("cutile"):
         "mla_decoding_split_kv",
         "moe",
         "moe_align_block",
+        "sliding_window_attention",
         "rope",
         "swiglu",
         "apply_rope_base",
